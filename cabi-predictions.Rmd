@@ -1,0 +1,84 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r warning = FALSE, message = FALSE}
+library(tidyverse)
+library(glue)
+library(tidymodels)
+library(janitor)
+library(lubridate)
+library(workflows)
+library(tune)
+```
+
+```{r}
+prefixes <- c(201905:201909)
+
+```
+
+```{r}
+
+read_cabi <- function(.x) {
+  path <- glue("{prefix}-capitalbikeshare-tripdata",
+  prefix = .x)
+  
+  read_csv(
+  glue("C:/Users/Rachel/Desktop/data/{path}.csv"),
+  col_types = cols(
+  Duration = col_double(),
+  `Start date` = col_datetime(format = ""),
+  `End date` = col_datetime(format = ""),
+  `Start station number` = col_character(),
+  `Start station` = col_character(),
+  `End station number` = col_character(),
+  `End station` = col_character(),
+  `Bike number` = col_character(),
+  `Member type` = col_character()
+  )
+  )
+}
+
+raw_data <- map_dfr(.x = prefixes, .f = read_cabi)
+
+cleaned_data_1 <- raw_data %>%
+  clean_names()
+```
+
+```{r}
+cleaned_data_2 <- cleaned_data_1 %>%
+  mutate(month = month(start_date),
+         hour = hour(start_date)) %>%
+  select(-start_station_number, -end_station_number, -bike_number) %>%
+  filter(month == 7)
+```
+
+```{r}
+set.seed(2010) #year CaBi started!
+
+cabi_split <- initial_split(cleaned_data_2)
+
+cabi_train <- training(cabi_split)
+
+cabi_test <- testing(cabi_split)
+
+rm(raw_data, cleaned_data_1, cleaned_data_2)
+```
+
+```{r}
+lm_spec <- linear_reg() %>%
+  set_engine("lm")
+
+cabi_wf <- workflow() %>%
+  add_formula(end_station ~ start_station + hour) %>%
+  add_model(lm_spec)
+
+cabi_results <- fit(cabi_wf, cabi_train)
+```
+
+```{r}
+cabi_results %>%
+  collect_metrics()
+```
+
