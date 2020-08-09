@@ -1,0 +1,350 @@
+---
+title: "Capital Bikeshare Ridership during COVID-19"
+author: Rachel Lesniak
+output:
+  html_document:
+            toc: true
+            toc_float: true
+            code_folding: hide
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 5, fig.height = 3, fig.align = "center")
+
+library(tidyverse)
+library(janitor)
+library(jsonlite)
+library(lubridate)
+library(here)
+library(sf)
+library(geojsonsf)
+library(leaflet)
+library(ggalt)
+
+viz_palette <- c("#DB504A", "#69A7A2", "#514277")
+
+viz_palette_rb <- c("#DB504A","#647aa3")
+
+```
+
+The data world seems to be focused on making models using COVID-19 cases and deaths. However, since April 1st, I've been anxious to get the March 2020 Capital Bikeshare data to see how COVID-19 has affected the use of the District of Columbia's public bikeshare system. I've come to terms with my emerging ["foamer"](https://www.good.is/articles/foamer) status.
+
+Open data from [Capital Bikeshare](https://www.capitalbikeshare.com/) is available [here](https://s3.amazonaws.com/capitalbikeshare-data/index.html). For this analysis, I compare March 2018, March 2019, and March 2020 data using trips that either start or end in the District of Columbia. Trips starting or ending in DC account for 95 percent of system trips for these three months. I also use the [API](https://gbfs.capitalbikeshare.com/gbfs/gbfs.json) for station information.
+
+
+```{r}
+
+# Station Location --------------------------------------------------------
+
+
+station_info <- fromJSON("https://gbfs.capitalbikeshare.com/gbfs/en/station_information.json") %>%
+  pluck("data") %>%
+  pluck("stations")
+
+region_info <- fromJSON("https://gbfs.capitalbikeshare.com/gbfs/en/system_regions.json") %>%
+  pluck("data") %>%
+  pluck("regions") %>%
+  filter(name == "Washington, DC")
+
+dc_stations <- station_info %>%
+  semi_join(region_info, by = "region_id") %>%
+  pull(short_name)
+
+# Import and Clean Data ---------------------------------------------------
+
+#Original data downloaded from: https://s3.amazonaws.com/capitalbikeshare-data/index.html
+
+files <- list.files(path = here::here(), pattern = ".csv")
+
+raw_data <- map_dfr(files, read_csv) %>%
+  clean_names()
+
+#Only uses existing stations, rather than all stations
+#Limitation of raw data - no tag for location, no historical station assignment
+dc_data <- raw_data %>%
+  filter(start_station_number %in% dc_stations |
+           end_station_number %in% dc_stations) %>%
+  mutate(year = as.factor(year(start_date)),
+         week = epiweek(start_date),
+         weekday = wday(start_date, label = TRUE))
+
+```
+
+## Comparison by year
+
+Let's stick with the basics - how many trips were taken in March 2020 compared to March 2018 or March 2019? At first glance, ridership has dropped but not in the extreme numbers we'd expect from the majority of the city staying home.
+
+
+```{r}
+# Year Comparisons --------------------------------------------------------
+
+#Simple Count - how many people rode in March?
+simple_counts <- dc_data %>%
+  count(year)
+
+simple_counts %>%
+  ggplot(aes(x = year, y = n)) +
+  geom_col(fill = viz_palette[1]) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(x="Year", y="Count of Trips",
+       title="March 2020 underperformed, not surprisingly",
+       subtitle="Count of trips by year, March 2018 - 2020") +
+  theme_classic()
+```
+
+## Comparison by week
+
+However, comparing by week shows the drastic changes in Week 12 and 13. In 2019, over 70,000 trips were taken in the last week of March. In 2020, that dropped 80 percent to not even 15,000 trips. 
+
+*Fun fact: week numbers are sometimes called CDC weeks because counting weeks in the year originates from epidemiology... The Baader-Meinhof phenomenon is real.*
+
+Mayor Muriel Bowser issued the first restrictions on mass gatherings of 250 people or more on Friday, March 13, the end of Week 11. By Friday, March 20, the restrictions tightened to 50 people or more. On Thursday, March 26, Mayor Bowser ordered all non-essential businesses to close. Some riders continued to use Capital Bikeshare through these two weeks, but most reasons to bike for transportation were going away. 
+
+```{r}
+
+#how many days are in each week? looking to ignore partial weeks
+days_in_week <- dc_data %>%
+  mutate(date = date(start_date)) %>%
+  distinct(year, week, date) %>%
+  count(year, week, name = "days")
+#stick with weeks 10-13 as those are the core of the month
+
+#Simple Count by week - how many people rode each week?
+#uses the US "epidemiological week" - starts on Sunday
+dc_data %>%
+  count(year, week, name = "trips") %>%
+  filter(week != 9 & week != 14) %>%
+  ggplot(aes(x = week, y = trips, fill = year)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::label_comma(),
+                     limits = c(0, 75000)) +
+  scale_fill_manual(values = viz_palette) +
+  facet_grid(~year) +
+    labs(x="Week Number", y="Count of Trips",
+       title="March 2020 started normally and ended defeated",
+       subtitle="Count of trips by week, March 2018 - 2020") +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+Throughout Week 12 and 13, there were still activities that attracted ridership, including the cherry blossom peak bloom at the Tidal Basin. What happens if we look at Tuesday - Thursday as a proxy for the "commuting week?" (This is transportation planners' favorite approach to look at travel patterns for jobs.)
+
+There's an even starker difference between the last two weeks of March in 2020 versus 2019. Besides COVID-19-related dips in ridership, the third week of March in 2018 also experienced a dip. Additional analysis using National Weather Service data shows there was 3 inches of snow that week.
+
+```{r}
+#Viewing by "weekday"
+#typically defined as Tues-Thurs in transportation land
+#removes people using vacation for three day weekend and
+#common telework days
+dc_data %>%
+  filter(str_detect(weekday, "Tue|Wed|Thu")) %>%
+  count(year, week, name = "trips") %>%
+  filter(week != 9 & week != 14) %>%
+  ggplot(aes(x = week, y = trips, fill = year)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::label_comma(),
+                     limits = c(0, 75000)) +
+  scale_fill_manual(values = viz_palette) +
+  facet_grid( ~ year) +
+  labs(
+    x = "Week Number",
+    y = "Count of Trips",
+    title = "Quarantine destroyed the bike commute",
+    subtitle = "Count of trips on Tues-Thurs by week, March 2018 - 2020"
+  ) +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+```{r}
+weather_files <- list.files(path = here::here("weather"), pattern = ".csv", full.names = TRUE)
+
+weather_raw_data <- map_dfr(weather_files, read_csv) %>%
+  clean_names()
+
+weather_data <- weather_raw_data %>%
+  mutate(
+    year = as.factor(year(date)),
+    week = epiweek(date),
+    weekday = wday(date, label = TRUE)) %>%
+  filter(str_detect(weekday, "Tue|Wed|Thu")) %>%
+  #manually enter NAs - sample size is small. Not great statistical practice
+  #but I'm deciding it's better than na.rm = TRUE in this case.
+  mutate(tmax = case_when(
+    date == "2018-03-06" ~ 46,
+    date == "2019-03-21" ~ 49,
+    TRUE ~ tmax
+  )) %>%
+  filter(week != 9 & week != 14) %>%
+  group_by(year, week) %>%
+  summarize(sum_prcp = sum(prcp),
+            avg_temp_max = mean(tmax)) %>%
+  ungroup()
+
+weather_data %>%
+  ggplot(aes(x = week, y = sum_prcp, fill = year)) +
+  geom_col() + 
+  scale_fill_manual(values = viz_palette) +
+  facet_grid(~year) +
+  labs(x = "Week Number", y = "Precipitation (Inches)",
+       title="In 2018, a snow storm kept bikes off the road",
+       subtitle="Total precipitation Tues-Thurs by week by year, \n March 2018 and 2019 (NWS GHCN)") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+```
+
+## Popular Stations during Social Distancing
+
+With non-essential businesses closed, where were people headed on Capital Bikeshare bikes? I ranked destination stations by their Week 13 ridership, looking for the (relative) winners in the era of social distancing. Stations near grocery stores were 5 of the top 10, and arguably 2 more could count as within the radius of grocery stores (New Hampshire & T NW for the Soviet Safeway and 15th and W NW for the U Street Trader Joe's). Many of these stations were highly ranked earlier in the month, which makes sense as they're in locations filled with residents and businesses. But some stations are "having their moment", such as 1st & M NE (Harris Teeter in NoMa) and 8th & O NW (Giant in Shaw).
+
+The other three stations were National Mall stations, which are historically the top stations.
+
+```{r, fig.height = 5}
+
+top_ten <- dc_data %>%
+  filter(year == 2020 & week %in% c(10, 11, 12, 13)) %>%
+  count(week, end_station_number, end_station) %>%
+  arrange(week, desc(n), end_station) %>%
+  group_by(week) %>%
+  mutate(rank = row_number()) %>%
+  ungroup() %>%
+  pivot_wider(id_cols = c("end_station_number", "end_station"), names_from = week, values_from = rank) %>%
+  filter(`13` <= 10) %>%
+  #Jefferson Memorial looks like it was out of service, causing an outlier
+  mutate(`10` = if_else(end_station == "Jefferson Memorial", NA_integer_, `10`))
+
+categories <- tibble::tribble(
+                ~end_station_number,       ~category,
+                              31201, "Grocery Store",
+                              31603, "Grocery Store",
+                              31101, "Grocery Store",
+                              31229,         "Other",
+                              31248, "Other",
+                              31288, "Other",
+                              31108, "Grocery Store",
+                              31281, "Grocery Store",
+                              31125,         "Other",
+                              31249, "Other"
+                )
+
+
+top_ten_categorized <- top_ten %>%
+  pivot_longer(cols = c("10", "11", "12", "13"), names_to = "week", values_to = "rank") %>%
+  left_join(categories, by = "end_station_number") 
+
+chart_labels <- top_ten_categorized %>%
+  group_by(end_station_number) %>%
+  top_n(1, wt = week) %>%
+  ungroup() %>%
+  separate(end_station, into = c("end_station", "other"), sep = "/")
+
+top_ten_categorized %>%
+  na.omit() %>%
+  ggplot(aes(
+    x = week,
+    y = rank,
+    color = category,
+    group = end_station
+  )) +
+  geom_line() +
+  geom_point() +
+  scale_y_reverse(sec.axis = dup_axis(
+    breaks = chart_labels$rank,
+    labels = chart_labels$end_station,
+    name = NULL
+  )) +
+  scale_color_manual(values = viz_palette_rb) +
+  labs(
+    x = "Week Number",
+    y = "Relative Rank",
+    title = "Stations near grocery stores rank in top 10",
+    subtitle = "Relative rank by week for top 10 destinations, March 2020"
+  ) +
+  theme_classic() +
+  theme(legend.position = "none") 
+
+```
+
+## Ridership at Popular Stations
+
+If riders are now riding to grocery stores, are any of these stations gaining ridership? I was hopeful, but even the top ranked stations have tanked compared to 2019. April 2020 ridership doesn't look promising.
+
+```{r}
+#has ridership increased at these stations?
+top_ten_trips <- dc_data %>%
+  filter(week == 13) %>%
+  count(year, end_station_number, end_station) %>%
+  arrange(year, desc(n), end_station) %>%
+  pivot_wider(id_cols = c("end_station_number", "end_station"), names_from = year, values_from = n) %>%
+  top_n(10, wt = `2020`)
+
+top_ten_trips_categorized <- top_ten_trips %>%
+  pivot_longer(cols = c("2018", "2019", "2020"), names_to = "year", values_to = "n") %>%
+  left_join(categories, by = "end_station_number") 
+
+top_ten_trips_categorized %>%
+  na.omit() %>%
+  ggplot(aes(
+    x = year,
+    y = n,
+    color = category,
+    group = end_station
+  )) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(labels = scales::label_comma()) +
+  scale_color_manual(values = viz_palette_rb) +
+  labs(
+    x = "Year",
+    y = "Total Trips",
+    title = "Ridership plummeted even for the top 10 destinations",
+    subtitle = "Total trips ending for each station, Week 13"
+  ) +
+  theme_classic() +
+  theme(legend.position = "none")  
+```
+
+## Drops in Demand
+
+If grocery stores are the only businesses attracting ridership, which stations are the "losers"? Unsurprisingly, it's the stations where no one lives. Stations in L'Enfant Plaza, Farragut Square, and Metro Center all have dropped significantly in the station rankings.
+
+```{r, fig.width = 7}
+big_drop <- dc_data %>%
+  filter(week == 13) %>%
+  filter(year == 2019 | year == 2020) %>%
+  count(year, end_station_number, end_station) %>%
+  arrange(year, desc(n), end_station) %>%
+  pivot_wider(id_cols = c("end_station_number", "end_station"), names_from = year, values_from = n) %>%
+  filter(!is.na(`2019`) & !is.na(`2020`)) %>%
+  arrange(desc(`2019`)) %>%
+  mutate(rank_2019 = row_number()) %>%
+  arrange(desc(`2020`)) %>%
+  mutate(rank_2020 = row_number(),
+         diff = rank_2019 - rank_2020) %>%
+  top_n(-10, diff) %>%
+  mutate(end_station = fct_reorder(end_station, desc(diff)))
+
+ggplot(big_drop, aes(x = rank_2019, xend = rank_2020, y = end_station)) +
+  geom_dumbbell(
+    color = "gray",
+    size_x = 3,
+    size_xend = 3,
+    colour_x = viz_palette_rb[2],
+    colour_xend = viz_palette_rb[1]
+  ) +
+  labs(
+    x = "Relative Ranking",
+    y = NULL,
+    title = "Employment centers drop from the rankings",
+    subtitle = "Relative rankings, Week 13 2019 and 2020"
+  ) +
+  scale_x_reverse() +
+  theme_classic()
+
+```
+
+## Mapping
+
+Want to see these results on a map? Yeah, me too. My geospatial skills weren't great to begin with, and I've let them atrophy since changing jobs. Collaborators welcome!
+
