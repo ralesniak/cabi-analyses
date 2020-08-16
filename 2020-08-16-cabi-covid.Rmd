@@ -1,0 +1,462 @@
+---
+title: "Capital Bikeshare during Summer 2020 (COVID-19 part 2)"
+author: "Rachel Lesniak"
+date: '2020-08-16'
+categories: []
+tags: []
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+```
+
+The data world seems to be focused on making models using COVID-19 cases and deaths. However, since April 1st, I've been anxious to get the March 2020 Capital Bikeshare data to see how COVID-19 has affected the use of the District of Columbia's public bikeshare system. I've come to terms with my emerging ["foamer"](https://www.good.is/articles/foamer) status.
+
+Like my [previous analysis](http://rachellesniak.com/2020/04/22/capital-bikeshare-ridership-during-covid-19/), open data from [Capital Bikeshare](https://www.capitalbikeshare.com/) is available [here](https://s3.amazonaws.com/capitalbikeshare-data/index.html). This analysis uses data from March to July 2020. I also use the [API](https://gbfs.capitalbikeshare.com/gbfs/gbfs.json) for station information.
+
+## Set Up
+
+Compared to the last analysis, I've made some cool (to me) changes. I download the data from the website using `walk` and import it using `vroom`. `vroom` is FAST and if you're not using it for CSVs, it's time to upgrade!
+
+I've also grown in my `ggplot2` skills, including [making palettes](https://drsimonj.svbtle.com/creating-corporate-colour-palettes-for-ggplot2), [adding color to titles](https://rfortherestofus.com/2020/05/color-titles-ggtext/), and understanding how to actually set `theme` elements to strip away the clutter. Next up is figuring out how to use custom fonts!
+
+```{r, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(vroom)
+library(janitor)
+library(testthat)
+library(jsonlite)
+library(lubridate)
+library(ggtext)
+source("blog_colors.R")
+source("blog_theme.R")
+
+cabi_path <-
+  glue::glue(
+    "https://s3.amazonaws.com/capitalbikeshare-data/{yearmo}-capitalbikeshare-tripdata.zip",
+    yearmo = c(202003:202007)
+  ) %>%
+  as.character()
+
+filenames <- basename(cabi_path)
+
+cabi_path_july <-
+  glue::glue(
+    "https://s3.amazonaws.com/capitalbikeshare-data/{yearmo}-capitalbikeshare-tripdata.zip",
+    yearmo = c(201807, 201907)
+  ) %>%
+  as.character()
+
+filenames_july <- basename(cabi_path_july)
+
+```
+
+In this step, I use the paths from before to download and save the files.
+
+``` {r eval = FALSE}
+
+walk2(.x = cabi_path, .y = filenames, .f = function(.x, .y) {
+  download.file(url = .x, destfile = .y) })
+
+walk2(.x = cabi_path_july, .y = filenames_july, .f = function(.x, .y) {
+  download.file(url = .x, destfile = .y) })
+
+```
+
+Using `vroom`, the .zip can be read it super quick. This was the step I found out that Lyft (or Motivate, but I blame Lyft) changed the data structure completely for April forward. I updated the March data to have the same column names for all of the essential column for this analysis.
+
+```{r, warning = FALSE, message = FALSE}
+
+#Lyft completely changed the data structure in April. Come on.
+
+apr_jul_data <- map_dfr(filenames[2:5], vroom)
+
+march_data <- vroom(filenames[1]) %>%
+  clean_names() %>%
+  select(started_at = start_date,
+         ended_at = end_date,
+         start_station_name = start_station,
+         start_station_id = start_station_number,
+         end_station_name = end_station,
+         end_station_id = end_station_number,
+         member_casual = member_type)
+
+old_july_data <- map_dfr(filenames_july, vroom) %>%
+  clean_names() %>%
+  select(
+    started_at = start_date,
+    ended_at = end_date,
+    start_station_name = start_station,
+    start_station_id = start_station_number,
+    end_station_name = end_station,
+    end_station_id = end_station_number,
+    member_casual = member_type
+  )
+
+```
+
+## Clean and filter data
+
+I binded the two datasets, but then, I found that Lyft made up completely new station IDs! Why?! For each station name, there were two IDs... except for the stations added after the data structure change.
+
+```{r}
+cleaned_data <- bind_rows(march_data, apr_jul_data)
+
+#Lyft made up completely new station IDs, but it looks like the names are unique, at least.
+#COME ON
+
+expect_equal({
+  cleaned_data %>% 
+    distinct(start_station_name, start_station_id) %>% 
+    count(start_station_name) %>% 
+    filter(n > 2) %>%
+    nrow()
+}, 0)
+
+#intersections that were added after the data format changed - no 3XXX ID
+  cleaned_data %>% 
+    distinct(start_station_name, start_station_id) %>% 
+    add_count(start_station_name) %>% 
+    filter(n < 2)
+
+```
+
+### Find DC stations from GBFS
+
+Because this analysis is focused on just the District of Columbia, I aimed to filter the stations using the station information in the General Bikeshare Feed Specification (GBFS) that can be retrieved from the API. On top of a new structure, and new IDs, there's not even a way to connect the new IDs to the old IDs. At this point, I started shouting.
+
+So, instead of IDs, I sighed and used the station name.
+
+
+```{r}
+# Station Location --------------------------------------------------------
+
+#Appears to only use the longer station number. The legacy/station_id don't
+#match up to the IDs in the dataset. COOL.
+
+station_info <- fromJSON("https://gbfs.capitalbikeshare.com/gbfs/en/station_information.json") %>%
+  pluck("data") %>%
+  pluck("stations")
+
+region_info <- fromJSON("https://gbfs.capitalbikeshare.com/gbfs/en/system_regions.json") %>%
+  pluck("data") %>%
+  pluck("regions") %>%
+  filter(name == "Washington, DC")
+
+dc_stations <- station_info %>%
+  semi_join(region_info, by = "region_id") %>%
+  pull(name)
+```
+
+### Filter to just DC stations
+
+The filter for the station name almost worked perfectly, except there were some names either missing or were variations. Based off of the station names not included, I manually put some back in.
+
+```{r, message = FALSE}
+#filter is now based off of name
+#so if the name isn't correct (I saw a 1st & K NE vs. 1st & K *St* NE)
+#it doesn't come into the data.
+#there are definitely some missing intersections that I've tried to correct
+
+dc_stations_2 <- c(
+  dc_stations,
+  "1st & K NE",
+  "15th & K St NW",
+  "17th & K St NW / Farragut Square",
+  "Vermont Ave & I St NW",
+  "New York Ave & 15th St NW",
+  "21st & M St NW"
+)
+
+```
+
+With the list of stations, we can filter the data for trips that start or end in DC. Then a couple of steps for use in analysis later or making charts cleaner, and we're ready to go!
+
+```{r, message = FALSE}
+
+dc_data <- cleaned_data %>%
+  filter(start_station_name %in% dc_stations_2 |
+           end_station_name %in% dc_stations_2) %>%
+  mutate(
+    year = year(started_at),
+    month = floor_date(started_at, unit = "month"),
+    week = epiweek(started_at),
+    weekday = wday(started_at, label = TRUE),
+    covid = if_else(date(started_at) >
+                      "2020-03-14", TRUE, FALSE),
+    #makes bar charts happy to be discrete label
+    month_label = month(month, label = TRUE, abbr = FALSE),
+    #make cases uniform
+    member_casual = str_to_title(member_casual)
+  )
+
+all_july_data <- old_july_data %>%
+  filter(start_station_name %in% dc_stations_2 |
+           end_station_name %in% dc_stations_2) %>%
+  mutate(
+    year = year(started_at),
+    month = floor_date(started_at, unit = "month"),
+    week = epiweek(started_at),
+    weekday = wday(started_at, label = TRUE),
+    covid = if_else(date(started_at) >
+                      "2020-03-14", TRUE, FALSE),
+    #makes bar charts happy to be discrete label
+    month_label = month(month, label = TRUE, abbr = FALSE),
+    #make cases uniform
+    member_casual = str_to_title(member_casual)
+  ) %>%
+  bind_rows({dc_data %>% filter(month_label == "July")})
+
+```
+
+## Ridership rebounds, sorta
+
+First of all, how is ridership generally? In my analysis of just March data, we found that ridership dropped off steeply. Looking at April through July, ridership has rebounded to some extent, with July hitting almost 200K trips.
+
+```{r, echo = FALSE}
+dc_data %>%
+  ggplot(aes(x = month_label, fill = covid)) +
+  geom_bar(position = position_stack(reverse = TRUE)) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  scale_fill_blog(palette = "emphasis") +
+  labs(
+    title = glue::glue(
+      "Overall ridership increased throughout <span style = 'color: {color};'>COVID-19</span>",
+      color = get_blog_colors("red")
+    ),
+    subtitle = glue::glue(
+      "Total monthly Capital Bikeshare trips in DC, {first_month} - {last_month} 2020",
+      first_month = min(dc_data$month_label),
+      last_month = max(dc_data$month_label)
+    )
+  ) +
+  theme_cabi()
+
+
+```
+
+However, the recovery didn't get the system back to previous July levels. Compared to 2018 and 2019, ridership is down 47 percent and 39 percent, respectively,  
+
+```{r, echo = FALSE}
+
+all_july_data %>%
+  mutate(year_label = glue::glue("July {year}")) %>%
+  ggplot(aes(x = year_label, fill = year_label)) +
+  geom_bar() +
+  scale_y_continuous(labels = scales::label_comma()) +
+  scale_fill_blog(palette = "main 3", reverse = TRUE) +
+  labs(
+    title = "July ridership has dropped almost 50% compared to 2018",
+    subtitle = glue::glue(
+      "Total monthly Capital Bikeshare trips in DC, July {first_year} - July {last_year}",
+      first_year = min(all_july_data$year),
+      last_year = max(all_july_data$year)
+    )
+  ) +
+  theme_cabi() + 
+    theme(
+    plot.title = element_markdown(size = 19)
+  )
+
+```
+
+## Bye bye, members
+
+If ridership has dropped almost 50 percent, who is still riding? Well, right now, casual riders are half of the total ridership in DC. This seems high to me...
+
+```{r, echo = FALSE}
+
+member_chart <- dc_data %>%
+  filter(month_label != "March")
+
+member_chart %>%
+  ggplot(aes(x = month_label, fill = member_casual)) +
+  geom_bar(position = position_dodge()) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  scale_fill_blog(palette = "main") +
+  labs(
+    title = glue::glue(
+      "<span style = 'color: {color};'>Casual riders</span> are half of Bikeshare trips",
+      color = get_blog_colors("red")
+    ),
+    subtitle = glue::glue(
+      "Total monthly Capital Bikeshare trips in DC by member type, {first_month} - {last_month} 2020",
+      first_month = min(member_chart$month_label),
+      last_month = max(member_chart$month_label)
+    )
+  ) +
+  theme_cabi()
+
+
+```
+
+Looking at July 2018 and 2019, casual riders are nowhere close to 50% of riders. It's clear to see that the loss of trips taken by Capital Bikeshare members is the main loss of ridership.
+
+```{r, echo = FALSE}
+
+all_july_data %>%
+  mutate(year_label = glue::glue("July {year}")) %>%
+  ggplot(aes(x = year_label, fill = member_casual)) +
+  geom_bar(position = position_dodge()) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  scale_fill_blog(palette = "main") +
+  labs(
+    title = glue::glue(
+      "Loss of trips by <span style = 'color: {color};'>members</span> caused decline in ridership",
+      color = get_blog_colors("purple")
+    ),
+    subtitle = glue::glue(
+      "Total monthly Capital Bikeshare trips in DC by member type, July {first_year} - July {last_year}",
+      first_year = min(all_july_data$year),
+      last_year = max(all_july_data$year)
+    )
+  ) +
+  theme_cabi()
+
+```
+
+I will take this time to note that right now, I'm not a member... and not by choice. I had a yearly membership that all of a sudden canceled, and now all my trips cost $1 without other fees. (To be fair, this is way cheaper on my end, since I rarely took a month's worth of trips, so I have no reason to renew). I imagine I can't be the only person this happened to, so I wonder if some previous members are hiding in the "casual" category.
+
+
+## Variation by Weekday
+
+I can't be a transportation planner and not look in the variation by weekday, right? No surprises here - members still are the majority of weekday riders, although probably not at the same proportion as before.
+
+
+```{r, echo = FALSE}
+
+weekday_chart <- dc_data %>%
+  filter(month_label != "March") %>%
+  count(week, weekday, member_casual) %>%
+  group_by(weekday, member_casual) %>%
+  summarize(avg_riders = mean(n)) %>%
+  ungroup()
+
+weekday_chart %>%
+  ggplot(aes(x = weekday, y = avg_riders, fill = member_casual)) +
+  geom_col(position = position_dodge()) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  scale_fill_blog(palette = "main") +
+  labs(
+    title = glue::glue(
+      "<span style = 'color: {color};'>Members</span> still take over the work week",
+      color = get_blog_colors("purple")
+    ),
+    subtitle = glue::glue(
+      "Average weekly Capital Bikeshare trips in DC by weekday, {first_month} - {last_month} 2020",
+      first_month = min(member_chart$month_label),
+      last_month = max(member_chart$month_label)
+    )
+  ) +
+  theme_cabi()
+
+```
+
+## Winning and losing stations
+
+Restaurants and retail are open, grocery stores are finally stocked - so who is going where? I thought this part of the analysis was the most interesting when looking at March, so I'm excited to show these results.
+
+In March, we see a couple of business hubs, Union Station and Dupont Circle, are in the top 10 of destinations. But by April, seven out of 10 are in dense neighborhoods with grocery stores. My hypothesis is that a lot of travel during early COVID was to get groceries, especially since nothing else was open and the message from the DC goverment was, emphatically, **stay home**. 
+
+In May, patterns changed again, with the National Mall returning as a hot destination, likely because of the Black Lives Matter protests. My partner asked, "why aren't stations near Black Lives Matter Plaza on the list," and I believe it's because [stations around the White House are closed](https://www.capitalbikeshare.com/blog/servicealert).
+
+In June and July, the trends went back to majority neighborhood stations. In June, 15th and L St NW popped up, likely because it's close to Black Lives Matter but is still operational. 
+
+```{r, fig.width = 11, echo = FALSE}
+
+heat_chart <- dc_data %>%
+  #if end_station_name is NA, then it's not in DC
+  filter(!is.na(end_station_name)) %>%
+  count(month_label, end_station_name) %>%
+  group_by(month_label) %>%
+  mutate(month_rank = as.integer(rank(desc(n), ties.method = "first"))) %>%
+  ungroup() %>%
+  filter(month_rank <= 10L) %>%
+  arrange(month_label, month_rank) %>%
+  #rename some stations to look better in the chart
+  mutate(
+    end_station_name = case_when(
+      str_detect(end_station_name, "Jefferson Dr & 12th St SW") ~ "Jefferson Dr & 12th St SW",
+      str_detect(end_station_name, "Massachusetts") ~ "Mass. Ave and Dupont Circle",
+      end_station_name == "Henry Bacon Dr & Lincoln Memorial Circle NW" ~ "Lincoln Memorial - South",
+      end_station_name == "Lincoln Memorial" ~ "Lincoln Memorial - North",
+      TRUE ~ end_station_name
+    ),
+    #make a label that includes the count
+    station_value = glue::glue("<b>{end_station_name}</b> <br> ({n})")
+  ) %>%
+  #assign stations to a category
+  mutate(
+    category = case_when(
+      str_detect(
+        end_station_name,
+        "Lincoln|Jefferson|Madison|Constitution|Independence"
+      ) ~ "National Mall",
+      str_detect(end_station_name, "34th & Water St NW") ~ "Other",
+      str_detect(end_station_name, "15th & L St NW") ~ "Other",
+      str_detect(end_station_name, "Columbus Circle") ~ "Other",
+      str_detect(end_station_name, "Dupont") ~ "Other",
+      TRUE ~ "Neighborhood"
+    )
+  )
+
+heat_chart %>%
+  ggplot(aes(x = month_label, y = month_rank, fill = category)) +
+  geom_tile() +
+  geom_richtext(aes(label = station_value),
+                size = 3,
+                label.color = NA) +
+  scale_x_discrete(position = "top") + 
+  scale_y_reverse(expand = c(0, 0),
+                  breaks = c(10:1)) +
+  scale_fill_blog(palette = "red blue gray") +
+  labs(
+    title = glue::glue(
+      "<span style = 'color: {color_mall};'>National Mall</span> popular during protests,
+      <span style = 'color: {color_nhoods};'>dense neighborhoods</span> with grocery stores round out top 10 ",
+      color_mall = get_blog_colors("red"),
+      color_nhoods = get_blog_colors("blue text")
+    ),
+    subtitle = glue::glue(
+      "Top 10 destinations by month ranked by total trips in DC, {first_month} - {last_month} 2020",
+      first_month = min(heat_chart$month_label),
+      last_month = max(heat_chart$month_label)
+    )
+  ) +
+  theme_cabi(base_size = 14)
+
+```
+
+Overall, the same stations are frequently in the top ten, with outliers popping up (34th & Water St, looking at you). However, ridership is growing over time, with 1st and M NE continuing to crush it each month. Why is everyone riding to NoMa? Is the Harris Teeter really that good?
+
+```{r, fig.width = 11, echo = FALSE}
+
+heat_chart %>%
+  ggplot(aes(x = month_label, y = month_rank, fill = n)) +
+  geom_tile() +
+  geom_richtext(aes(label = station_value),
+                size = 3,
+                label.color = NA) +
+  scale_fill_steps(low = get_blog_colors("gray"),
+                   high = get_blog_colors("purple")) +
+  scale_x_discrete(position = "top") + 
+  scale_y_reverse(expand = c(0, 0),
+                  breaks = c(10:1)) +
+  labs(
+    title = glue::glue(
+      "Same stations consistently in top ten, but ridership gets stronger in June and July"),
+    subtitle = glue::glue(
+      "Top 10 destinations by month ranked by total trips in DC, {first_month} - {last_month} 2020",
+      first_month = min(heat_chart$month_label),
+      last_month = max(heat_chart$month_label)
+    )
+  ) +
+  theme_cabi(base_size = 14)
+
+```
+
+
+## Mapping
+
+Another invitation to join me in this analysis by mapping! Let's collaborate!
